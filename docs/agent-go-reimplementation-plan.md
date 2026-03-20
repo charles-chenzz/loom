@@ -305,112 +305,490 @@ type MCPTransport interface {
 
 ---
 
-## OAuth Connect and LLM Client Integration
+## Local Credential Configuration and LLM Client Resolution
 
 ### Design Intent
 
-Support an explicit `connect oauth` flow that opens the provider's official login page, stores
-tokens locally, and then activates provider OAuth mode (single account or pool) for `LlmClient`.
+`agent-go` is a single-process REPL/TUI application, not a split CLI/server deployment. The user
+configures provider credentials locally from the TUI, typically via `/model` or an initial `llm
+init` flow. The runtime then resolves the selected model profile into a concrete provider client,
+while the agent layer continues to depend only on the `LlmClient` interface.
 
-### OAuth Connect Sequence (Authorization Code + PKCE)
+This keeps the same architectural boundary as Loom's server-side `LlmClient` design, but moves
+credential management and provider client construction into the local application.
+
+### User Experience in TUI
+
+The primary entrypoint is `/model`:
+
+1. choose provider (`openai`, `anthropic`, `zai`, future providers)
+2. choose backend/profile type supported by that provider
+3. configure or select a local credential
+4. choose default model
+5. persist the profile and make it active for the current session
+
+Example `/model` interactions:
+
+1. `OpenAI Platform`
+2. `Auth Method: API Key`
+3. `Credential: paste API key or select saved key`
+4. `Default Model: gpt-4o`
+
+The same flow should be available in a first-run `llm init` wizard for non-TUI onboarding.
+
+### Core Architectural Rule
+
+The agent loop must not know whether a request is powered by:
+
+1. a raw API key
+2. an OAuth token set
+3. an externally-managed session token
+4. an alternate backend adapter that translates requests before calling a provider
+
+The agent only holds:
+
+```go
+type LlmClient interface {
+    Complete(ctx context.Context, req LlmRequest) (LlmResponse, error)
+    CompleteStreaming(ctx context.Context, req LlmRequest) (LlmStream, error)
+}
+```
+
+Everything below that boundary is runtime configuration and provider adapter work.
+
+### Local Configuration Model
+
+Store two kinds of local state:
+
+1. credentials
+2. model profiles
+
+Credential store example:
+
+```json
+{
+  "openai-default-key": {
+    "provider": "openai",
+    "type": "api_key",
+    "api_key": "sk-..."
+  },
+  "anthropic-max-1": {
+    "provider": "anthropic",
+    "type": "oauth",
+    "access": "at_...",
+    "refresh": "rt_...",
+    "expires": 1735500000000
+  }
+}
+```
+
+Model profile example:
+
+```json
+{
+  "default": {
+    "provider": "openai",
+    "backend": "openai_platform",
+    "credential_id": "openai-default-key",
+    "model": "gpt-4o"
+  },
+  "claude-max": {
+    "provider": "anthropic",
+    "backend": "anthropic_subscription",
+    "credential_id": "anthropic-max-1",
+    "model": "claude-opus-4-20250514"
+  }
+}
+```
+
+`/model` edits the profile layer, not the agent loop.
+
+### Provider Capability Model
+
+Providers should advertise supported local configuration modes instead of assuming OAuth:
+
+```go
+type AuthMethod string
+
+const (
+    AuthMethodAPIKey AuthMethod = "api_key"
+    AuthMethodOAuth  AuthMethod = "oauth"
+    AuthMethodSession AuthMethod = "session_token"
+)
+
+type ProviderCapability struct {
+    Provider        string
+    Backends        []string
+    SupportedAuth   []AuthMethod
+    SupportsPooling bool
+}
+```
+
+Initial expected capabilities:
+
+1. `openai`
+   - backend: `openai_platform`
+   - auth: `api_key`
+2. `anthropic`
+   - backend: `anthropic_api`
+   - auth: `api_key`
+   - optional backend: `anthropic_subscription`
+   - auth: provider-specific OAuth/session flow
+3. experimental adapters
+   - can expose alternate backend names without changing the agent layer
+
+This is the right extension point for any future OpenAI-compatible or Codex-style adapter. The
+backend is what changes request construction and transport behavior; `LlmClient` does not.
+
+### Resolution Sequence
 
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant CLI as agent-go CLI
-    participant B as System Browser
-    participant O as Provider OAuth Server
-    participant C as Local Callback Server
-    participant T as Token Endpoint
-    participant S as Credential Store
-    participant P as OAuth Pool Manager
+    participant T as TUI (/model)
+    participant P as Profile Store
+    participant C as Credential Store
+    participant R as Client Resolver
+    participant B as Provider Backend
     participant L as LlmClient
+    participant A as Agent Loop
 
-    U->>CLI: agent-go auth connect anthropic --provider-id claude-max-1
-    CLI->>CLI: Generate state + PKCE verifier/challenge
-    CLI->>C: Start localhost callback listener
-    CLI->>B: Open official authorize URL
-    B->>O: GET /authorize?client_id=...&redirect_uri=...&code_challenge=...&state=...
-    U->>O: Login + consent
-    O-->>B: Redirect to http://127.0.0.1:<port>/callback?code=...&state=...
-    B->>C: Deliver callback request
-    C->>CLI: Return code + state
-    CLI->>CLI: Validate state and callback timeout
-    CLI->>T: POST /token (grant_type=authorization_code, code_verifier)
-    T-->>CLI: access_token + refresh_token + expires_at
-    CLI->>S: Save credential entry by provider-id
-    CLI->>P: Reload account set and mark Available
-    P->>L: Provide OAuth-backed provider client
-    CLI-->>U: Connected successfully (provider-id ready)
+    U->>T: /model
+    T->>C: create/update credential
+    T->>P: save active model profile
+    U->>A: send prompt
+    A->>R: resolve active profile
+    R->>P: load profile
+    R->>C: load credential by credential_id
+    R->>B: build concrete provider client
+    B-->>R: configured LlmClient
+    R-->>A: LlmClient
+    A->>L: Complete / CompleteStreaming
 ```
 
-### Device Code Fallback (Headless)
+### Backend Adapter Pattern
 
-When browser callback is unavailable (remote SSH/headless), support device flow fallback:
+Provider integrations should be split into three pieces:
 
-1. CLI requests device code from OAuth server
-2. CLI prints `verification_uri` + `user_code`
-3. user completes login in external browser
-4. CLI polls token endpoint until approved/expired
-5. token is stored the same way as browser flow
+1. credential parser/validator
+2. backend adapter
+3. optional auth lifecycle manager
 
-### Credential Storage and Pool Activation
+Suggested interfaces:
 
-Store credentials in one JSON map keyed by provider ID:
+```go
+type ResolvedCredential struct {
+    Provider string
+    Type     AuthMethod
+    Fields   map[string]string
+}
+
+type ProviderBackend interface {
+    Name() string
+    Provider() string
+    BuildClient(ctx context.Context, cred ResolvedCredential, model string) (LlmClient, error)
+}
+
+type CredentialValidator interface {
+    Validate(cred ResolvedCredential) error
+}
+```
+
+Examples:
+
+1. `openai_platform` backend
+   - validates API key
+   - creates the normal OpenAI client
+2. `anthropic_api` backend
+   - validates API key
+   - creates normal Anthropic HTTP client
+3. `anthropic_subscription` backend
+   - reads token/session data
+   - injects provider-specific headers or prompt constraints
+   - refreshes or reconnects when the credential expires
+4. future experimental backend
+   - transforms OpenAI-style requests into another upstream protocol
+   - still returns `LlmClient`
+
+### Request Path After Profile Selection
+
+1. agent runtime asks the resolver for the active profile's `LlmClient`
+2. resolver loads the referenced credential
+3. backend adapter validates credential material
+4. backend adapter creates the concrete provider client
+5. agent sends `complete` or `complete_streaming`
+6. provider-specific auth/header/session behavior happens below `LlmClient`
+
+This preserves dependency direction:
+
+1. agent depends on `internal/core`
+2. runtime depends on `internal/config` and `internal/llm/...`
+3. provider packages never depend on the agent loop
+
+### Local Pooling
+
+Pooling should be designed as a profile/backend concern, not an agent concern.
+
+If needed later, allow a profile to reference multiple credentials:
 
 ```json
 {
-  "claude-max-1": {
-    "type": "oauth",
-    "refresh": "rt_...",
-    "access": "at_...",
-    "expires": 1735500000000
+  "openai-team": {
+    "provider": "openai",
+    "backend": "openai_platform",
+    "credential_ids": ["openai-key-a", "openai-key-b"],
+    "model": "gpt-4o"
   }
 }
 ```
 
 Activation behavior:
 
-1. if exactly one OAuth provider configured -> single OAuth client mode
-2. if multiple provider IDs configured -> OAuth pool mode with failover
-3. pool and client implementation still satisfy the same `LlmClient` interface
+1. one credential -> single client mode
+2. multiple credentials -> pooled client with retry/cooldown/failover
+3. pooled client still implements `LlmClient`
 
-### Request Path After Connect
-
-1. runtime sends `complete`/`complete_streaming` to `LlmClient`
-2. OAuth auth injector adds provider-specific auth material (token/headers/prefix)
-3. request executes with token refresh when needed
-4. classifier handles errors:
-   - transient -> retry same account
-   - quota exhausted -> cooldown + failover (pool mode)
-   - permanent auth error -> disable account and surface action
-
-### Provider-Specific Adapter Pattern
-
-Use a shared OAuth framework with provider adapters:
-
-1. shared: PKCE/state handling, callback listener, token exchange, secure persistence
-2. provider adapter: auth header format, extra required headers, system-prompt constraints,
-   quota-error classification
-
-This allows OpenAI OAuth or other provider OAuth without changing core agent/runtime APIs.
-
-### OpenAI OAuth / Other Provider OAuth Extension
-
-Add provider entries with the same connect pipeline:
-
-1. `agent-go auth connect openai --provider-id openai-work-1`
-2. provider adapter defines authorize/token endpoints and request auth injection
-3. optional provider-specific pool strategy and error classification rules
-4. `LlmService` chooses provider client from the same `LlmClient` contract
+This keeps the plan compatible with future pool management without centering the whole design on
+OAuth.
 
 ### Security and UX Requirements
 
-1. never log access/refresh tokens
-2. redact secrets in debug output
-3. bind callback listener to localhost only
-4. enforce short callback timeout and state validation
-5. provide clear reconnect command when refresh fails (`agent-go auth reconnect <provider-id>`)
+1. never log API keys, access tokens, refresh tokens, or session tokens
+2. redact secrets in debug output and panic paths
+3. store credentials in OS keychain when possible, file fallback otherwise
+4. make `/model` idempotent: editing a profile should not require restarting the app
+5. allow quick switching between saved profiles in the TUI
+6. provide explicit validation feedback when a saved credential is missing or malformed
+7. keep auth lifecycle code below the `LlmClient` boundary
+
+---
+
+## Prompt, Context, and Planning Architecture
+
+### Design Intent
+
+Loom's current core design is transcript-first: conversation messages are appended to a canonical
+thread/conversation history and then used to build `LlmRequest`. For `agent-go`, keep that thread
+philosophy for local persistence, but add explicit extension points for:
+
+1. prompt composition
+2. request-time context selection
+3. planning state
+
+This preserves a simple v1 implementation while leaving room for more capable coding-agent behavior
+later.
+
+### Canonical Data vs Request-Time Projection
+
+The most important boundary is:
+
+1. `thread` is the canonical persisted record of what actually happened
+2. `request context` is a temporary projection built for a single LLM turn
+
+This means:
+
+1. raw user messages, assistant responses, and tool results are written to the thread transcript
+2. the runtime may choose to send only a subset of that history to the LLM
+3. summaries, plans, pinned instructions, and provider-specific prompt material are request-time
+   inputs, not replacements for the canonical transcript
+
+Do not overwrite the original thread transcript with trimmed or summarized context.
+
+### Runtime Components
+
+Add three runtime-facing extension points:
+
+```go
+type PromptComposer interface {
+    Compose(ctx context.Context, profile ModelProfile, tools []ToolSpec) (string, error)
+}
+
+type ContextManager interface {
+    Build(ctx context.Context, thread Thread, turn TurnInput) ([]Message, error)
+}
+
+type PlanMemory interface {
+    Current(ctx context.Context, threadID string) (PlanSnapshot, error)
+    Update(ctx context.Context, threadID string, delta PlanDelta) error
+}
+```
+
+Expected responsibilities:
+
+1. `PromptComposer`
+   - produces the base system/developer prompt for the current run
+   - may include tool protocol, coding style, output contract, or safety policy
+2. `ContextManager`
+   - selects which messages and tool outputs should be sent this turn
+   - may start as transcript-based in v1, then later gain trimming/summarization
+3. `PlanMemory`
+   - stores task goal, current step, open questions, and deferred work
+   - can begin as a stub or empty implementation in v1
+
+### v1 Stub Strategy
+
+For a resume-oriented implementation, keep the first version intentionally small:
+
+1. `PromptComposer`
+   - return one fixed agent system prompt string
+2. `ContextManager`
+   - return recent messages or the full transcript for now
+3. `PlanMemory`
+   - define interfaces and types, but allow a no-op/empty implementation
+
+This is simple enough to ship quickly but demonstrates that the architecture already has the right
+seams for a more serious coding agent.
+
+### End-to-End Turn Chain
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as Agent Runtime
+    participant S as State Machine
+    participant T as Thread Store
+    participant P as PlanMemory
+    participant C as ContextManager
+    participant M as PromptComposer
+    participant R as RequestBuilder
+    participant L as LlmClient
+
+    U->>A: prompt
+    A->>S: UserInput
+    S-->>A: SendLlmRequest
+    A->>T: load canonical thread transcript
+    A->>P: load current plan snapshot
+    A->>C: select request messages
+    A->>M: compose system prompt
+    A->>R: build LlmRequest
+    R->>L: Complete / CompleteStreaming
+    L-->>A: LlmResponse / stream
+    A->>T: append assistant message/tool results
+    A->>P: update plan snapshot if needed
+    A->>S: LlmEvent::Completed / ToolCompleted
+```
+
+The key idea is that the state machine decides that an LLM request should happen, but the runtime
+decides how to assemble that request.
+
+### Thread Relationship
+
+The local thread model should remain Loom-like:
+
+1. thread stores the full transcript
+2. thread stores metadata such as provider, model, workspace, and agent state
+3. thread is written after each meaningful event so sessions can resume cleanly
+
+Prompt/context/plan do not replace thread persistence. They sit on top of it.
+
+Recommended relationship:
+
+```go
+type Thread struct {
+    ID         string
+    Messages   []Message
+    Metadata   ThreadMetadata
+    AgentState AgentStateSnapshot
+}
+
+type PlanSnapshot struct {
+    Goal          string
+    CurrentStep   string
+    OpenQuestions []string
+    Todo          []string
+}
+
+type RequestContext struct {
+    SystemPrompt string
+    Messages     []Message
+    Plan         *PlanSnapshot
+}
+```
+
+### Request Assembly Pipeline
+
+Build `LlmRequest` in a dedicated runtime stage:
+
+1. load active thread
+2. load current plan snapshot
+3. select messages from transcript
+4. compose system prompt
+5. assemble tools and model settings
+6. build final `LlmRequest`
+
+Formula:
+
+```text
+LlmRequest =
+    RequestBuilder(
+        system_prompt = PromptComposer(profile, tools),
+        messages      = ContextManager(thread, turn_input),
+        plan          = PlanMemory(thread_id),
+        tools         = active_tools,
+        model         = active_profile.model,
+    )
+```
+
+This keeps the top-level agent clean while making the request path explicit and extensible.
+
+### Provider-Specific Prompt Injection
+
+Provider-specific prompt requirements belong below the generic prompt/context layer.
+
+Examples:
+
+1. generic coding-agent policy belongs in `PromptComposer`
+2. provider request mapping belongs in the provider backend
+3. provider-specific hacks or mandatory prefixes belong in the provider backend/client adapter
+
+This mirrors Loom's Anthropic handling, where provider-specific OAuth system prompt material is
+added during provider request construction rather than by the core state machine.
+
+### Planning Lifecycle
+
+Planning should be optional in v1 but visible in the architecture.
+
+```mermaid
+flowchart TD
+    A[User Turn] --> B[State Machine emits SendLlmRequest]
+    B --> C[Load Thread]
+    C --> D[Load Plan Snapshot]
+    D --> E[Select Context]
+    E --> F[Compose Prompt]
+    F --> G[Send Request]
+    G --> H[Receive Response]
+    H --> I[Append Response to Thread]
+    I --> J[Optionally Update Plan]
+```
+
+Possible future plan update triggers:
+
+1. after the model proposes a multi-step approach
+2. after a tool run changes the workspace significantly
+3. after the user changes goals
+4. after a summarization checkpoint
+
+### Non-Goals for v1
+
+To keep implementation bounded, v1 does not need:
+
+1. automatic summarization of old transcript segments
+2. retrieval-augmented memory over the repository
+3. autonomous planner loops
+4. complex token-budget optimization
+
+The architecture should merely reserve the right place for those features.
+
+### Why This Fits the Resume Goal
+
+This design is still simple enough to implement quickly, but it demonstrates:
+
+1. clear separation between persisted state and request-time context
+2. awareness of long-horizon agent design problems
+3. extension points for future planning and memory work
+4. a cleaner story than "the agent just forwards the full transcript forever"
+
+That is a stronger architecture story without materially increasing v1 implementation risk.
 
 ---
 
