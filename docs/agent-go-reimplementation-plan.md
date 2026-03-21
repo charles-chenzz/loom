@@ -567,20 +567,20 @@ OAuth.
 
 ### Design Intent
 
-Loom's current core design is transcript-first: conversation messages are appended to a canonical
-thread/conversation history and then used to build `LlmRequest`. For `agent-go`, keep that thread
-philosophy for local persistence, but add explicit extension points for:
+Loom's core design remains transcript-first: conversation messages are appended to a canonical
+thread history and then projected into each `LlmRequest`.
 
-1. prompt composition
-2. request-time context selection
-3. planning state
+For `agent-go`, implement a single-model convergence path with three additions:
 
-This preserves a simple v1 implementation while leaving room for more capable coding-agent behavior
-later.
+1. layered context projection
+2. recoverable summary memory
+3. budget-based selection with explicit drop reasons
+
+This gives better quality than naive truncation while keeping v1 implementation bounded.
 
 ### Canonical Data vs Request-Time Projection
 
-The most important boundary is:
+The most important boundary is unchanged:
 
 1. `thread` is the canonical persisted record of what actually happened
 2. `request context` is a temporary projection built for a single LLM turn
@@ -594,50 +594,165 @@ This means:
 
 Do not overwrite the original thread transcript with trimmed or summarized context.
 
+### Thread Scope Guarantee
+
+To keep changes localized:
+
+1. `thread` subsystem continues to handle full-fidelity persistence, resume, and rollback
+2. summary and planning artifacts live outside canonical transcript storage
+3. request-time context decisions are recomputed each turn from thread + sidecar memory
+
+The thread design does not need a structural rewrite for this architecture.
+
+### Memory Layers (Single-Model)
+
+Use four layers when building each request:
+
+1. `Canonical Transcript`
+   - full persisted history in thread store
+2. `Working Set`
+   - messages guaranteed to be sent this turn (recent goal, recent tool chain, latest user turn)
+3. `Summary Memory`
+   - compressed history slices with source anchors back to transcript ranges
+4. `Plan Snapshot`
+   - compact execution intent (`goal`, `current_step`, `todo`, `open_questions`)
+
+Only layers 2-4 are projected into `LlmRequest`; layer 1 remains the source of truth.
+
 ### Runtime Components
 
-Add three runtime-facing extension points:
+Add runtime-facing extension points with explicit observability:
 
 ```go
+type PromptBundle struct {
+    SystemBase    string
+    RuntimeRules  string
+    ToolProtocol  string
+    ProviderPatch string
+    PromptHash    string
+}
+
+type RequestBudget struct {
+    MaxInputTokens  int
+    ReserveForOutput int
+    HardCapTokens   int
+}
+
+type ContextSelection struct {
+    Messages        []Message
+    IncludedMessageIDs []string
+    EstimatedInputTokens int
+    DroppedReason   []string
+}
+
 type PromptComposer interface {
-    Compose(ctx context.Context, profile ModelProfile, tools []ToolSpec) (string, error)
+    Compose(ctx context.Context, profile ModelProfile, tools []ToolSpec) (PromptBundle, error)
 }
 
 type ContextManager interface {
-    Build(ctx context.Context, thread Thread, turn TurnInput) ([]Message, error)
+    Build(
+        ctx context.Context,
+        thread Thread,
+        turn TurnInput,
+        plan PlanSnapshot,
+        summaries []SummarySlice,
+        budget RequestBudget,
+    ) (ContextSelection, error)
+}
+
+type SummaryStore interface {
+    LoadByThread(ctx context.Context, threadID string) ([]SummarySlice, error)
+    Upsert(ctx context.Context, slice SummarySlice) error
+    InvalidateFromVersion(ctx context.Context, threadID string, version int64) error
 }
 
 type PlanMemory interface {
     Current(ctx context.Context, threadID string) (PlanSnapshot, error)
-    Update(ctx context.Context, threadID string, delta PlanDelta) error
+    Update(ctx context.Context, threadID string, delta PlanDelta, expected PlanAnchor) error
+}
+
+type TokenEstimator interface {
+    Estimate(messages []Message) (int, error)
+    EstimateText(text string) int
 }
 ```
 
 Expected responsibilities:
 
 1. `PromptComposer`
-   - produces the base system/developer prompt for the current run
-   - may include tool protocol, coding style, output contract, or safety policy
+   - composes deterministic prompt blocks with stable ordering
+   - returns a hash for debugging and reproducibility
 2. `ContextManager`
-   - selects which messages and tool outputs should be sent this turn
-   - may start as transcript-based in v1, then later gain trimming/summarization
-3. `PlanMemory`
-   - stores task goal, current step, open questions, and deferred work
-   - can begin as a stub or empty implementation in v1
+   - enforces token budget and message priority
+   - explains what was excluded and why
+3. `SummaryStore`
+   - stores recoverable summaries anchored to transcript ranges
+   - supports invalidation when history rewrites/rollback occur
+4. `PlanMemory`
+   - stores compact planning state with version anchor
+   - uses optimistic update semantics via `expected` anchor
+
+### Recoverable Summary Format
+
+Summary slices must be traceable to canonical transcript ranges:
+
+```go
+type SummarySourceRef struct {
+    ThreadID      string
+    ThreadVersion int64
+    StartMessageID string
+    EndMessageID   string
+}
+
+type SummarySlice struct {
+    ID             string
+    ThreadID       string
+    Kind           string // history|tool_output|decision
+    Text           string
+    SourceRefs     []SummarySourceRef
+    CreatedAtUnixMs int64
+}
+```
+
+Rules:
+
+1. never summarize without at least one source reference
+2. if source references are stale after rollback, invalidate affected slices
+3. summary text is advisory; canonical transcript remains authoritative
+
+### Budget Policy
+
+Request assembly must be budget-first:
+
+1. compute model-specific max context
+2. reserve output budget (`ReserveForOutput`)
+3. fill input budget by priority tiers
+
+Suggested priority tiers:
+
+1. latest user turn and unresolved user constraints
+2. current plan snapshot
+3. latest assistant/tool exchange chain
+4. pinned instructions / repo constraints
+5. relevant summary slices
+6. older raw transcript windows
+
+When the budget is exceeded, drop from lowest-priority tier upward and record `DroppedReason`.
 
 ### v1 Stub Strategy
 
-For a resume-oriented implementation, keep the first version intentionally small:
+For a resume-oriented implementation, keep behavior simple but interfaces production-shaped:
 
 1. `PromptComposer`
-   - return one fixed agent system prompt string
+   - compose `SystemBase + RuntimeRules + ToolProtocol`, empty `ProviderPatch` is allowed
 2. `ContextManager`
-   - return recent messages or the full transcript for now
-3. `PlanMemory`
-   - define interfaces and types, but allow a no-op/empty implementation
+   - implement deterministic recency + priority trimming with token estimates
+3. `SummaryStore`
+   - start with local JSON sidecar files per thread and coarse invalidation by `thread_version`
+4. `PlanMemory`
+   - start with a minimal local store and optional no-op updates
 
-This is simple enough to ship quickly but demonstrates that the architecture already has the right
-seams for a more serious coding agent.
+This remains small enough for v1, but avoids rework when adding richer memory behavior.
 
 ### End-to-End Turn Chain
 
@@ -647,6 +762,7 @@ sequenceDiagram
     participant A as Agent Runtime
     participant S as State Machine
     participant T as Thread Store
+    participant SS as SummaryStore
     participant P as PlanMemory
     participant C as ContextManager
     participant M as PromptComposer
@@ -657,13 +773,15 @@ sequenceDiagram
     A->>S: UserInput
     S-->>A: SendLlmRequest
     A->>T: load canonical thread transcript
+    A->>SS: load summary slices by thread
     A->>P: load current plan snapshot
-    A->>C: select request messages
+    A->>C: select request messages under token budget
     A->>M: compose system prompt
     A->>R: build LlmRequest
     R->>L: Complete / CompleteStreaming
     L-->>A: LlmResponse / stream
     A->>T: append assistant message/tool results
+    A->>SS: optionally upsert summary slices
     A->>P: update plan snapshot if needed
     A->>S: LlmEvent::Completed / ToolCompleted
 ```
@@ -677,7 +795,7 @@ The local thread model should remain Loom-like:
 
 1. thread stores the full transcript
 2. thread stores metadata such as provider, model, workspace, and agent state
-3. thread is written after each meaningful event so sessions can resume cleanly
+3. thread persists on turn completion and graceful shutdown
 
 Prompt/context/plan do not replace thread persistence. They sit on top of it.
 
@@ -692,16 +810,24 @@ type Thread struct {
 }
 
 type PlanSnapshot struct {
+    Anchor        PlanAnchor
     Goal          string
     CurrentStep   string
     OpenQuestions []string
     Todo          []string
 }
 
+type PlanAnchor struct {
+    ThreadID      string
+    ThreadVersion int64
+    LastMessageID string
+}
+
 type RequestContext struct {
-    SystemPrompt string
-    Messages     []Message
-    Plan         *PlanSnapshot
+    Prompt         PromptBundle
+    Selection      ContextSelection
+    Plan           *PlanSnapshot
+    Budget         RequestBudget
 }
 ```
 
@@ -710,26 +836,89 @@ type RequestContext struct {
 Build `LlmRequest` in a dedicated runtime stage:
 
 1. load active thread
-2. load current plan snapshot
-3. select messages from transcript
-4. compose system prompt
-5. assemble tools and model settings
-6. build final `LlmRequest`
+2. load summary slices
+3. load current plan snapshot
+4. compute request budget for current model
+5. select messages from transcript + summaries + plan under budget
+6. compose system prompt bundle
+7. assemble tools and model settings
+8. build final `LlmRequest`
 
 Formula:
 
 ```text
 LlmRequest =
     RequestBuilder(
-        system_prompt = PromptComposer(profile, tools),
-        messages      = ContextManager(thread, turn_input),
-        plan          = PlanMemory(thread_id),
-        tools         = active_tools,
-        model         = active_profile.model,
+        prompt_bundle  = PromptComposer(profile, tools),
+        messages       = ContextManager(thread, turn_input, plan, summaries, budget),
+        plan_snapshot  = PlanMemory(thread_id),
+        tools          = active_tools,
+        model          = active_profile.model,
+        budget         = model_budget,
     )
 ```
 
 This keeps the top-level agent clean while making the request path explicit and extensible.
+
+### Context Selection Pseudocode
+
+```go
+func BuildRequestContext(ctx context.Context, in BuildInput) (RequestContext, error) {
+    prompt, err := in.PromptComposer.Compose(ctx, in.Profile, in.Tools)
+    if err != nil {
+        return RequestContext{}, err
+    }
+
+    plan, _ := in.PlanMemory.Current(ctx, in.Thread.ID)
+    summaries, _ := in.SummaryStore.LoadByThread(ctx, in.Thread.ID)
+
+    budget := ComputeBudget(in.Profile.ModelContextWindow)
+
+    selection, err := in.ContextManager.Build(
+        ctx,
+        in.Thread,
+        in.Turn,
+        plan,
+        summaries,
+        budget,
+    )
+    if err != nil {
+        return RequestContext{}, err
+    }
+
+    reqCtx := RequestContext{
+        Prompt:    prompt,
+        Selection: selection,
+        Plan:      &plan,
+        Budget:    budget,
+    }
+    return reqCtx, nil
+}
+```
+
+```go
+func (cm *DefaultContextManager) Build(
+    ctx context.Context,
+    thread Thread,
+    turn TurnInput,
+    plan PlanSnapshot,
+    summaries []SummarySlice,
+    budget RequestBudget,
+) (ContextSelection, error) {
+    sel := ContextSelection{}
+    remaining := budget.MaxInputTokens - budget.ReserveForOutput
+
+    sel.addLatestUserTurn(turn, &remaining)
+    sel.addPlan(plan, &remaining)
+    sel.addRecentToolChain(thread.Messages, &remaining)
+    sel.addPinnedPolicies(thread.Metadata, &remaining)
+    sel.addRelevantSummaries(summaries, &remaining)
+    sel.addOlderTranscriptWindows(thread.Messages, &remaining)
+
+    sel.finalizeDroppedReasons()
+    return sel, nil
+}
+```
 
 ### Provider-Specific Prompt Injection
 
@@ -758,7 +947,8 @@ flowchart TD
     F --> G[Send Request]
     G --> H[Receive Response]
     H --> I[Append Response to Thread]
-    I --> J[Optionally Update Plan]
+    I --> J[Optionally Refresh Summaries]
+    J --> K[Optionally Update Plan]
 ```
 
 Possible future plan update triggers:
@@ -768,14 +958,25 @@ Possible future plan update triggers:
 3. after the user changes goals
 4. after a summarization checkpoint
 
+### Plan Consistency Rule
+
+To avoid drift between plan and transcript:
+
+1. each `PlanSnapshot` carries `PlanAnchor`
+2. `PlanMemory.Update` must verify anchor matches current thread head
+3. on mismatch, reload plan and recompute delta instead of blind overwrite
+
+This keeps planning state coherent without changing thread persistence contracts.
+
 ### Non-Goals for v1
 
 To keep implementation bounded, v1 does not need:
 
-1. automatic summarization of old transcript segments
+1. multi-model summary/execution split
 2. retrieval-augmented memory over the repository
 3. autonomous planner loops
-4. complex token-budget optimization
+4. semantic vector retrieval for summaries
+5. advanced token-budget optimization beyond deterministic tiered selection
 
 The architecture should merely reserve the right place for those features.
 
@@ -785,8 +986,9 @@ This design is still simple enough to implement quickly, but it demonstrates:
 
 1. clear separation between persisted state and request-time context
 2. awareness of long-horizon agent design problems
-3. extension points for future planning and memory work
-4. a cleaner story than "the agent just forwards the full transcript forever"
+3. recoverable summary and budget-aware context construction
+4. extension points for future planning and memory work
+5. a cleaner story than "the agent just forwards the full transcript forever"
 
 That is a stronger architecture story without materially increasing v1 implementation risk.
 
