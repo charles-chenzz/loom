@@ -77,6 +77,12 @@ resume or interview.
 - stdlib `os/exec`, `bufio`, `io`, `sync` for stdio-based MCP transport
 - stdlib `net/http` (or `resty`) for streamable HTTP transport
 
+### TUI (Minimal Go Implementation)
+
+- `charmbracelet/bubbletea` for event loop and state updates
+- `charmbracelet/bubbles` for input, list, viewport, help widgets
+- `charmbracelet/lipgloss` for styling and layout
+
 ---
 
 ## Architecture Mapping (Rust Design -> Go Design)
@@ -98,6 +104,10 @@ resume or interview.
   - skill prompt/context injection before `LlmRequest` assembly
 - `loom-cli` -> `cmd/agent` + `internal/runtime`
   - REPL, action dispatcher, event loop
+- `loom-tui` (minimal, go-native) -> `internal/tui`
+  - default interactive shell for `agent-go` command
+  - slash command palette and modal/form-based command UI
+  - streaming event renderer (assistant/thinking/tool lifecycle)
 - `mcp-system` (conceptual client role) -> `internal/mcp`
   - MCP server lifecycle manager (add/remove/list/reconnect)
   - JSON-RPC request/response client
@@ -143,6 +153,13 @@ agent-go/
     resolver.go
     state.go
     policy.go
+  internal/tui/
+    app.go
+    model.go
+    slash.go
+    panels.go
+    events.go
+    forms.go
   internal/runtime/
     loop.go
   internal/mcp/
@@ -734,6 +751,66 @@ This keeps architecture and implementation concerns separated.
 
 ---
 
+## TUI Interaction Model (Minimal)
+
+### Entry Contract
+
+Command entry behavior is split between TUI and cobra subcommands:
+
+1. `agent-go` with no positional subcommand enters TUI directly
+2. `agent-go <subcommand>` (for example `thread`, `resume`, `search`, `private`, `share`) stays as
+   cobra CLI behavior
+3. TUI slash commands call the same underlying application services as cobra commands
+
+This keeps one runtime while offering both conversational and script-friendly interfaces.
+
+### Runtime and TUI Boundary
+
+`internal/runtime` remains the orchestrator for LLM/SSE/tool execution:
+
+1. runtime owns state-machine action execution
+2. runtime normalizes streaming and tool lifecycle events
+3. TUI subscribes to normalized runtime events and focuses only on rendering and user input
+
+This boundary avoids duplicating orchestration logic in TUI.
+
+### In-TUI Slash UX
+
+Inside TUI, typing `/` opens a slash command palette with fuzzy filtering and keyboard selection.
+
+Minimum slash command surface:
+
+1. `/model`
+2. `/mcp`
+3. `/skills`
+4. `/thread`
+5. `/help`
+6. `/quit`
+
+For commands requiring arguments or selection, TUI opens a modal/form flow rather than forcing
+inline argument syntax.
+
+### Event Rendering Surface
+
+TUI should render three event classes distinctly:
+
+1. assistant response stream (`TextDelta`)
+2. reasoning/thinking stream (when available)
+3. tool lifecycle (`started`, `output`, `completed`, `failed`)
+
+This provides user-visible progress while preserving deterministic runtime behavior.
+
+### Detailed TUI Implementation Doc
+
+Detailed slash interaction flowchart, runtime-to-TUI event protocol, pseudocode, and testing plan are
+documented in:
+
+- [`docs/agent-go-tui-minimal-implementation-checklist.md`](./agent-go-tui-minimal-implementation-checklist.md)
+
+This keeps the current document focused on architecture-level decisions.
+
+---
+
 ## ACP IDE Integration Design
 
 ### Design Intent
@@ -1197,6 +1274,14 @@ This prevents traversal and symlink escape attacks.
 - Integrate skill prompt/context injection into request assembly path
 - Add integration tests for explicit and implicit activation behavior
 
+### Milestone 9 - Minimal TUI Layer
+
+- Implement Go-native TUI shell as default `agent-go` entrypoint
+- Keep cobra subcommands (`thread`, `resume`, `search`, etc.) intact for non-TUI usage
+- Add slash command palette and modal/form interactions for `/model`, `/mcp`, `/skills`, `/thread`
+- Render normalized runtime stream events (assistant/thinking/tool lifecycle)
+- Add TUI integration tests for entry routing and slash command execution
+
 ---
 
 ## Resume-Focused Highlights
@@ -1215,6 +1300,8 @@ Use wording similar to the following:
    dynamically imports remote tools into the local agent tool registry.
 6. Designed a runtime skill orchestration layer with deterministic explicit activation and automatic
    skill matching, integrated into prompt/context/plan assembly.
+7. Built a Go-native TUI shell with slash command palette, backed by a shared runtime event bus for
+   streamed responses and tool lifecycle visibility.
 
 ---
 
@@ -1226,7 +1313,8 @@ Use wording similar to the following:
 4. Show extensibility: provider interface + tool registry.
 5. Show orchestration depth: explicit/implicit skill activation above tool execution.
 6. Show ecosystem integration: MCP client manager with namespaced remote tools.
-7. End with outcomes: simple codebase, clear tests, and easy feature growth.
+7. Show operator UX: default TUI with slash workflows and live tool/stream visibility.
+8. End with outcomes: simple codebase, clear tests, and easy feature growth.
 
 ---
 
@@ -1238,5 +1326,6 @@ Use wording similar to the following:
 - Day 4: reliability hardening and integration tests
 - Day 5: MCP manager, stdio transport, tool import bridge, and `/mcp` commands
 - Day 6: skill activation layer (`/skills`, matcher, resolver, request injection)
+- Day 7: minimal TUI shell + slash palette + runtime event rendering
 
 This timeline keeps scope realistic while preserving architecture depth for resume and interviews.
