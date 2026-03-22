@@ -9,6 +9,7 @@ architecture highlights discussed earlier:
 - Trait/interface-based LLM abstraction
 - SSE streaming normalization
 - Tool registry with JSON schema
+- Skill orchestration with explicit/implicit activation
 - Workspace security boundary and retry reliability
 
 This plan is intentionally scoped so it can be completed in a few days and explained clearly in a
@@ -28,6 +29,7 @@ resume or interview.
 6. Structured logging and bounded retry
 7. MCP client-side server management (Claude Code-like) with dynamic remote tool import
 8. ACP mode over stdio JSON-RPC for IDE-driven sessions
+9. Skill system with explicit activation and runtime auto-activation
 
 ### Out of Scope (for v1)
 
@@ -37,6 +39,7 @@ resume or interview.
 4. Large observability platform (crash analytics, product analytics UI)
 5. Implementing our own MCP server endpoint (this design focuses on MCP client behavior)
 6. ACP authentication methods and non-text multimodal content blocks
+7. Skill marketplace/distribution and remote trust federation
 
 ---
 
@@ -89,6 +92,10 @@ resume or interview.
   - `Tool` interface + `Registry`
   - `read_file`, `list_files`, `edit_file`
   - workspace root path guard
+- `skill-system` (agent runtime orchestration role) -> `internal/skills`
+  - Skill manifest loader and registry
+  - explicit activation state (`/skills use`) and auto-activation matcher
+  - skill prompt/context injection before `LlmRequest` assembly
 - `loom-cli` -> `cmd/agent` + `internal/runtime`
   - REPL, action dispatcher, event loop
 - `mcp-system` (conceptual client role) -> `internal/mcp`
@@ -129,6 +136,13 @@ agent-go/
     read_file.go
     list_files.go
     edit_file.go
+  internal/skills/
+    manifest.go
+    registry.go
+    matcher.go
+    resolver.go
+    state.go
+    policy.go
   internal/runtime/
     loop.go
   internal/mcp/
@@ -649,6 +663,77 @@ dedicated playbook.
 
 ---
 
+## Skill System Design (Activation-First)
+
+### Design Intent
+
+Skills are a runtime orchestration layer above tools:
+
+1. tools are executable capabilities exposed to the model via tool registry
+2. skills are policy and workflow bundles injected by runtime into prompt/context/plan
+3. skill activation is controlled by agent runtime, not left to best-effort model behavior
+
+This allows deterministic explicit activation while preserving model autonomy for implicit matching.
+
+### Core Requirements
+
+1. Explicit user activation must be 100% effective for installed and valid skills
+2. Runtime can auto-activate relevant skills based on user turn and session state
+3. Skill injection happens before `LlmRequest` build and is visible in request metadata/logging
+4. Skill dependencies on tools/MCP tools are validated before activation
+
+### Activation Modes
+
+1. Explicit mode:
+   - user invokes `/skills use <skill-id>`
+   - runtime marks skill as `forced_active`
+   - every subsequent request includes that skill until `/skills off <skill-id>`
+2. Implicit mode:
+   - matcher evaluates installed skills against current user input and context
+   - runtime auto-activates candidates that pass confidence and policy checks
+3. Optional model-suggested mode:
+   - model can request activation through a dedicated control tool
+   - runtime validates and applies policy before activation
+
+### Deterministic Precedence
+
+Activation resolution order:
+
+1. `forced_active` (user explicit) — highest priority
+2. `user_disabled` — block list
+3. `auto_matched` — runtime implicit activation
+4. `model_suggested` — optional, lowest priority
+
+If conflicts occur, keep explicit activation and drop conflicting lower-priority skills.
+
+### Runtime Integration Boundary
+
+Skills integrate into request-time projection only:
+
+1. `PromptComposer` consumes active skill prompt blocks
+2. `ContextManager` can apply skill-specific context filters or pinned instructions
+3. `PlanMemory` can apply skill-specific planning templates
+4. canonical thread transcript remains unchanged as source of truth
+
+### Thread Relationship
+
+Thread persistence remains full-fidelity and transcript-first. Skill layer stores only control state:
+
+1. active skill ids and activation source metadata
+2. optional per-turn applied skill list for audit/debugging
+3. no expanded skill prompt text persisted into canonical transcript
+
+### Detailed Skill Implementation Doc
+
+Implementation checklist, sequence diagrams, pseudocode, state model, CLI commands, and tests are
+documented in:
+
+- [`docs/agent-go-skill-system-implementation-checklist.md`](./agent-go-skill-system-implementation-checklist.md)
+
+This keeps architecture and implementation concerns separated.
+
+---
+
 ## ACP IDE Integration Design
 
 ### Design Intent
@@ -1104,6 +1189,14 @@ This prevents traversal and symlink escape attacks.
 - Add optional sync client and pending queue retry path
 - Add private-thread sync guard and visibility/share metadata handling
 
+### Milestone 8 - Skill Activation Layer
+
+- Implement `internal/skills` manifest loader, registry, matcher, and resolver
+- Add `/skills` CLI commands (`list/use/off/auto/status`)
+- Enforce deterministic precedence and explicit activation guarantees
+- Integrate skill prompt/context injection into request assembly path
+- Add integration tests for explicit and implicit activation behavior
+
 ---
 
 ## Resume-Focused Highlights
@@ -1120,6 +1213,8 @@ Use wording similar to the following:
    LLM orchestration.
 5. Implemented a Claude Code-like MCP client manager that connects to external MCP servers and
    dynamically imports remote tools into the local agent tool registry.
+6. Designed a runtime skill orchestration layer with deterministic explicit activation and automatic
+   skill matching, integrated into prompt/context/plan assembly.
 
 ---
 
@@ -1129,8 +1224,9 @@ Use wording similar to the following:
 2. Explain architecture choice: explicit state machine + action dispatcher.
 3. Show reliability/security: backoff retries + workspace path guard.
 4. Show extensibility: provider interface + tool registry.
-5. Show ecosystem integration: MCP client manager with namespaced remote tools.
-6. End with outcomes: simple codebase, clear tests, and easy feature growth.
+5. Show orchestration depth: explicit/implicit skill activation above tool execution.
+6. Show ecosystem integration: MCP client manager with namespaced remote tools.
+7. End with outcomes: simple codebase, clear tests, and easy feature growth.
 
 ---
 
@@ -1141,5 +1237,6 @@ Use wording similar to the following:
 - Day 3: tool registry + tools + runtime wiring
 - Day 4: reliability hardening and integration tests
 - Day 5: MCP manager, stdio transport, tool import bridge, and `/mcp` commands
+- Day 6: skill activation layer (`/skills`, matcher, resolver, request injection)
 
 This timeline keeps scope realistic while preserving architecture depth for resume and interviews.
